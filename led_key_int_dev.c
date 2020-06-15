@@ -1,4 +1,5 @@
 #include <linux/module.h>
+#include <linux/poll.h>
 
 #include <linux/fs.h>
 #include <linux/errno.h>
@@ -25,6 +26,7 @@
 #include <linux/of_irq.h>
 #include <linux/irq.h>
 #include <linux/interrupt.h>
+#include <linux/fcntl.h>
 
 
 
@@ -35,8 +37,7 @@
 struct key_irq_desc{
 	int gpio;
 	int irqnum;
-	irqreturn_t (*handler)(int, void *);
-	int flag;
+	irqreturn_t (*handler)(int, void *);	
 };
 
 
@@ -51,18 +52,16 @@ struct char_dev{
 	struct device_node *nd_led; //device tree node led
 	int gpio_led;
 	struct device_node *nd_key; //device tree node key
-	struct device_node *nd_key2; //device tree node key
  //	int gpio_key;
 	struct key_irq_desc key1irqdesc;
 	struct key_irq_desc key2irqdesc;
-	struct tasklet_struct key_tasklet;
-	struct tasklet_struct key2_tasklet;	
+	struct tasklet_struct key_tasklet;	
 };
 
 //define variables
 static struct char_dev *led_dev;
-static char dev_buf[100];
 static DECLARE_WAIT_QUEUE_HEAD(key_wait);
+static struct fasync_struct *led_dev_fasync;
 
 //tasklet
 void delay_short(volatile unsigned int n)
@@ -93,30 +92,6 @@ void key_tasklet_opr(unsigned long data){
 		}
 		printk("key operated in tasklet, gpio_led=%d \r\n",gpio_get_value(devc->gpio_led));	
 	}
-}
-
-void key2_tasklet_opr(unsigned long data){
- 	struct key_irq_desc *keydesc;
-	struct char_dev *devc = (struct char_dev *)data;
-	keydesc = &devc->key2irqdesc;
-	delay(10);
-	if(gpio_get_value(devc->key2irqdesc.gpio) == 0){
-		printk("key2 press confirmed, app wake up.\r\n");
-		devc->key2irqdesc.flag = 1;
-		wake_up_interruptible(&key_wait);
-	}
-/*
-	if(gpio_get_value(devc->key2irqdesc.gpio) == 0){
-	printk("key2 press confirmed.\r\n");		
-		if(gpio_get_value(devc->gpio_led) == 0){
-			gpio_set_value(devc->gpio_led, 1);
-		}
-		else if(gpio_get_value(devc->gpio_led) == 1){
-			gpio_set_value(devc->gpio_led, 0);	
-		}
-	printk("key2 operated in tasklet, gpio_led=%d \r\n",gpio_get_value(devc->gpio_led));	
-	}
-*/
 
 }
 
@@ -131,13 +106,31 @@ static irqreturn_t key1_irq_handler(int irq, void *dev_id){
 
 static irqreturn_t key2_irq_handler(int irq, void *dev_id){
 
+	printk("app wakeup.\r\n");
 	
-	struct char_dev *devc = (struct char_dev *)dev_id;
-	devc->key2_tasklet.data = (unsigned long)dev_id;
-	tasklet_schedule(&devc->key2_tasklet);	
+	wake_up_interruptible(&key_wait);
+
+	kill_fasync(&led_dev_fasync, SIGIO, POLLIN);
+
 	return IRQ_RETVAL(IRQ_HANDLED);
 	
-	
+}
+
+static unsigned int key2_poll(struct file *fp, poll_table * wait){
+	struct char_dev *devc = fp->private_data;
+	printk("key2 poll settle.");
+	poll_wait(fp, &key_wait, wait);
+	printk("key2 poll running, gpio_key=%d \r\n",gpio_get_value(devc->key2irqdesc.gpio)); 
+
+	return gpio_get_value(devc->key2irqdesc.gpio) ? 0 : POLLIN | POLLRDNORM;
+}
+
+static int led_key_fasync(int fd, struct file *file, int on)
+{
+	if (fasync_helper(fd, file, on, &led_dev_fasync) >= 0)
+		return 0;
+	else
+		return -EIO;
 }
 
 
@@ -223,8 +216,8 @@ static int hw_init(struct char_dev *led_dev){
 
 	printk("ready to init key2 dev.\r\n");
 
-	led_dev->nd_key2 = of_find_node_by_path("/key2");
-	if(led_dev->nd_key2 == NULL){
+	led_dev->nd_key = of_find_node_by_path("/key2");
+	if(led_dev->nd_key == NULL){
 		printk("node key2 not found.\r\n");
 		return -1;
 	}
@@ -232,7 +225,7 @@ static int hw_init(struct char_dev *led_dev){
 		printk("node key2 has been found.\r\n");
 	}
 
-	led_dev->key2irqdesc.gpio = of_get_named_gpio(led_dev->nd_key2, "key-gpio", 0);
+	led_dev->key2irqdesc.gpio = of_get_named_gpio(led_dev->nd_key, "key-gpio", 0);
 	if(led_dev->key2irqdesc.gpio < 0){
 		printk("get key2 gpio failed.");
 		return -1;
@@ -247,13 +240,11 @@ static int hw_init(struct char_dev *led_dev){
 	
 	led_dev->key2irqdesc.handler = key2_irq_handler;	
 	led_dev->key2irqdesc.irqnum = gpio_to_irq(led_dev->key2irqdesc.gpio);
-	led_dev->key2irqdesc.flag = 0;
 	printk("key2 irqnum is:%d \r\n",led_dev->key2irqdesc.irqnum);
 	if(led_dev->key2irqdesc.irqnum == 0){
 		printk("key2 failed to get an irq num.");
 		return -1;
 	}
-	tasklet_init(&led_dev->key2_tasklet, key2_tasklet_opr, led_dev->key2_tasklet.data);
 	err = request_irq(led_dev->key2irqdesc.irqnum, led_dev->key2irqdesc.handler, IRQF_TRIGGER_FALLING, "key2", led_dev);
 	if(err < 0) {
 		printk("key2 irq request failed");
@@ -280,8 +271,8 @@ static ssize_t led_read(struct file *file, char __user *buf, size_t size, loff_t
 	struct char_dev *devc = file->private_data;
 	int key_status;
 
-	wait_event_interruptible(key_wait, devc->key2irqdesc.flag);
-	devc->key2irqdesc.flag = 0;
+	wait_event_interruptible(key_wait, !gpio_get_value(devc->key2irqdesc.gpio));
+
 	if(gpio_get_value(devc->gpio_led) == 0){
 		gpio_set_value(devc->gpio_led, 1);
 	}
@@ -301,6 +292,7 @@ static ssize_t led_read(struct file *file, char __user *buf, size_t size, loff_t
 static ssize_t led_write(struct file *file, const char __user *buf, size_t size, loff_t *offset)
 {
 	int err = 0;
+	char dev_buf[15];
 	struct char_dev *devc = file->private_data;
 
 	err = copy_from_user(dev_buf, buf, size);
@@ -333,6 +325,8 @@ static struct file_operations led_dev_fops = {
 	.read = led_read,
 	.write = led_write,
 	.release = led_release,
+	.poll = key2_poll,
+	.fasync = led_key_fasync,
 };
 
 //init and exit
@@ -381,7 +375,7 @@ static void __exit led_exit(void)
 	//release interrupt
 	free_irq(led_dev->key1irqdesc.irqnum, led_dev);
 	free_irq(led_dev->key2irqdesc.irqnum, led_dev);
-	
+
 	//unregister dev
 	cdev_del(&led_dev->cdev);
 	unregister_chrdev_region(led_dev->devid, 1);
