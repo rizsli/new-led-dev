@@ -7,6 +7,7 @@
 #include <string.h>
 #include <poll.h>
 #include <signal.h>
+#include <pthread.h>
 
 static char blk_flg;
 
@@ -15,6 +16,13 @@ static void sig_func(int sig)
 blk_flg = 0;
 }
 
+void *stat_thread(void *arg){
+	int i=0;
+	while(1){
+		sleep(1);
+		printf("you have been blinking for %d secs, press key2 to quit.\r\n",(++i));
+	}
+}
 
 int main(int argc, char **argv)
 {
@@ -26,6 +34,7 @@ int main(int argc, char **argv)
 	int retval;
 	int timeout_ms = 5000;
 	int flags;
+	pthread_t tid1; 
 
     if(argc < 2 || argc > 3){
         printf("invalid argument.\r\nexp: ./led_dev_test on | off | key\r\n");
@@ -78,17 +87,23 @@ int main(int argc, char **argv)
         }
     }
 	else if(strcmp(argv[1],"blink") == 0)
-    {      
+    {   
+    	retval = pthread_create(&tid1, NULL, stat_thread, NULL);
+		if(retval != 0){
+		perror("pthread create error");
+		return -1;
+		}
+		
         printf("blinking...\r\n");
 		blk_flg = 1;
         while(blk_flg){
         status = 1;
         write(fd, &status, 1);
-		sleep(1);
+		usleep(200000);
 		
         status = 0;
         write(fd, &status, 1);
-		sleep(1);
+		usleep(200000);
         }
 		printf("blink end.\r\n");
     }
